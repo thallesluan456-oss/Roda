@@ -1,0 +1,157 @@
+name: Windows RDP over Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_user:
+        description: "Nome do usuário RDP"
+        required: false
+        default: "rdpuser"
+      timeout_minutes:
+        description: "Minutos de sessão (max 350)"
+        required: false
+        default: "350"
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Criar usuário RDP com senha forte
+        shell: pwsh
+        env:
+          RDP_USER: ${{ inputs.rdp_user }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $user = $env:RDP_USER
+
+          $chars = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%*'
+          $password = -join (1..20 | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          $secure   = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $secure
+          } else {
+            New-LocalUser -Name $user -Password $secure `
+              -FullName "RDP User" `
+              -Description "Ephemeral RDP user" `
+              -PasswordNeverExpires -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators"        -Member $user -ErrorAction SilentlyContinue
+
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_USERNAME=$user"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Habilitar RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1
+
+          Set-Service    -Name TermService -StartupType Automatic
+          Start-Service  -Name TermService
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              Set-NetFirewallRule -Name $_.Name -RemoteAddress "100.64.0.0/10" -ErrorAction SilentlyContinue
+            }
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+      - name: Instalar Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $out = "$env:RUNNER_TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          Start-Process -FilePath $out -ArgumentList "/quiet" -Wait
+
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
+                      [System.Environment]::GetEnvironmentVariable("Path","User")
+
+      - name: Conectar Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:TS_AUTHKEY) {
+            Write-Error "Secret TAILSCALE_AUTH_KEY não definido no repositório."
+          }
+
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) { $exe = "tailscale" }
+
+          & $exe up --authkey=$env:TS_AUTHKEY --unattended --hostname="gh-rdp-$env:GITHUB_RUN_ID" --accept-routes
+
+          $ip = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 3
+            $ip = (& $exe ip -4 2>$null) | Select-Object -First 1
+            if ($ip -match '^100\.') { break }
+          }
+
+          if (-not ($ip -match '^100\.')) {
+            Write-Error "Tailscale não obteve IP após 90 segundos."
+          }
+
+          "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verificar saúde do RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $svc = Get-Service TermService
+          if ($svc.Status -ne "Running") {
+            Start-Service TermService
+            Start-Sleep -Seconds 3
+            $svc = Get-Service TermService
+          }
+          if ($svc.Status -ne "Running") { Write-Error "TermService não subiu." }
+
+          $listen = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if (-not $listen) { Write-Error "RDP não está ouvindo na porta 3389." }
+
+          Write-Host "TermService: $($svc.Status)"
+          Write-Host "RDP listening: $($listen.LocalAddress -join ', ')"
+
+      - name: Emitir credenciais nos logs
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host " ACESSO RDP - CONECTE NA SUA TAILNET"
+          Write-Host "=================================================="
+          Write-Host " IP Tailscale : $env:TS_IP"
+          Write-Host " Porta        : 3389"
+          Write-Host " Usuario      : $env:RDP_USERNAME"
+          Write-Host " Senha        : $env:RDP_PASSWORD"
+          Write-Host "--------------------------------------------------"
+          Write-Host " Cliente: mstsc /v:$env:TS_IP"
+          Write-Host " Usuario no mstsc: .\$env:RDP_USERNAME"
+          Write-Host " Requer: Tailscale logado na mesma tailnet"
+          Write-Host "=================================================="
+          Write-Host ""
+
+      - name: Manter sessão viva
+        shell: pwsh
+        env:
+          TIMEOUT_MIN: ${{ inputs.timeout_minutes }}
+        run: |
+          $minutes = [int]$env:TIMEOUT_MIN
+          if ($minutes -gt 350) { $minutes = 350 }
+          Write-Host "Mantendo a VM viva por $minutes minutos."
+          Start-Sleep -Seconds ($minutes * 60)
